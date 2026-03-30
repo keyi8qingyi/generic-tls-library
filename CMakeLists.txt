@@ -113,6 +113,7 @@ if(BUILD_TESTS)
         tests/rekey_manager_test.cpp
         tests/connection_pool_test.cpp
         tests/protocol_adapter_test.cpp
+        tests/integration_test.cpp
     )
     target_link_libraries(gtls_tests
         PRIVATE
