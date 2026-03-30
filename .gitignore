@@ -1,0 +1,36 @@
+# Build directories
+build/
+build_*/
+cmake-build-*/
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+
+# Executables
+*.out
+gtls_tests
+radius_demo
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+_deps/
+Testing/
+*.cmake
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
