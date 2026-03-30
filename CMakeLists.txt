@@ -111,6 +111,8 @@ if(BUILD_TESTS)
         tests/tls_connection_test.cpp
         tests/tls_io_test.cpp
         tests/rekey_manager_test.cpp
+        tests/connection_pool_test.cpp
+        tests/protocol_adapter_test.cpp
     )
     target_link_libraries(gtls_tests
         PRIVATE
