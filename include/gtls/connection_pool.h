@@ -1,12 +1,17 @@
 // =============================================================================
-// Generic TLS Library (gtls) - Connection pool management
-// Manages multiple TLS tunnels indexed by TunnelKey (host + port + config name).
-// Supports connection reuse, idle cleanup, and per-target connection limits.
+// Generic TLS Library (gtls) - Connection pool management (v2)
+// Manages multiple TLS tunnels indexed by TunnelKey.
+// Key improvements over v1:
+//   - PooledConn state machine (IDLE / IN_USE / BROKEN) prevents double-dispatch
+//   - Per-connection last_used tracking for precise idle cleanup
+//   - condition_variable for blocking wait when pool is exhausted
+//   - Health check on acquire to detect stale connections
 // =============================================================================
 #ifndef GTLS_CONNECTION_POOL_H
 #define GTLS_CONNECTION_POOL_H
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -17,110 +22,110 @@
 
 #include "gtls/tls_connection.h"
 #include "gtls/tls_context.h"
+#include "gtls/tls_error.h"
 
 namespace gtls {
 
 // Unique identifier for a TLS tunnel.
-// Composed of target host, port, and optional TLS config name.
 struct TunnelKey {
-    std::string host;             // Target server IP address or hostname
-    uint16_t port;                // Target server port
-    std::string tls_config_name;  // Optional TLS config name for multi-config scenarios
+    std::string host;
+    uint16_t port;
+    std::string tls_config_name;
 
     bool operator==(const TunnelKey& other) const;
 };
 
-// Hash function for TunnelKey, enabling use in std::unordered_map.
 struct TunnelKeyHash {
     std::size_t operator()(const TunnelKey& key) const;
 };
 
-// Connection pool configuration parameters.
+// Connection pool configuration.
 struct PoolConfig {
-    int max_connections_per_target = 4;   // Max connections per TunnelKey
-    int idle_timeout_sec = 600;           // Idle connection timeout in seconds
-    int connect_timeout_sec = 30;         // TCP + TLS handshake timeout in seconds
+    int max_connections_per_target = 4;
+    int idle_timeout_sec = 600;
+    int connect_timeout_sec = 30;
+    int acquire_timeout_sec = 5;  // Max time to wait for an idle connection
+};
+
+// Per-connection wrapper with state tracking.
+struct PooledConn {
+    enum class State { IDLE, IN_USE, BROKEN };
+
+    std::shared_ptr<TlsConnection> conn;
+    State state = State::IDLE;
+    std::chrono::steady_clock::time_point last_used;
+
+    PooledConn() = default;
+    explicit PooledConn(std::shared_ptr<TlsConnection> c)
+        : conn(std::move(c)),
+          state(State::IDLE),
+          last_used(std::chrono::steady_clock::now()) {}
 };
 
 // Connection pool statistics snapshot.
 struct PoolStats {
-    size_t total_active;          // Total number of active connections across all tunnels
-    std::unordered_map<TunnelKey, size_t, TunnelKeyHash> per_target;  // Per-target counts
-    size_t total_capacity;        // Sum of max_connections_per_target for all known tunnels
+    size_t total_active;    // All connections (IDLE + IN_USE)
+    size_t total_idle;      // IDLE connections only
+    size_t total_in_use;    // IN_USE connections only
+    std::unordered_map<TunnelKey, size_t, TunnelKeyHash> per_target;
+    size_t total_capacity;
 };
 
-// Manages a pool of TLS connections organized by TunnelKey.
-// Thread-safe: all public methods are protected by an internal mutex.
-//
-// Acquire strategy:
-//   1. Reuse an existing idle connection for the tunnel
-//   2. Create a new connection if under the per-target limit
-//   3. Reuse the least-recently-used connection if at the limit
-//
-// Lock ordering convention (to avoid deadlocks):
-//   ConnectionPool::mutex_ -> TlsContext::mutex_ -> TlsConnection::mutex_
+// Result of an acquire operation.
+struct AcquireResult {
+    std::shared_ptr<TlsConnection> conn;  // nullptr on failure
+    TlsError error = TlsError::Ok;
+};
+
+// Thread-safe connection pool with state machine, health checks, and
+// blocking wait support.
 class ConnectionPool {
 public:
-    // Construct a connection pool with the given configuration.
     explicit ConnectionPool(PoolConfig config = {});
-
-    // Destructor. Shuts down and releases all managed connections.
     ~ConnectionPool();
 
-    // Non-copyable, non-movable.
     ConnectionPool(const ConnectionPool&) = delete;
     ConnectionPool& operator=(const ConnectionPool&) = delete;
-    ConnectionPool(ConnectionPool&&) = delete;
-    ConnectionPool& operator=(ConnectionPool&&) = delete;
 
-    // Acquire a connection for the given tunnel key.
-    // Strategy: reuse idle -> create new (if under limit) -> reuse LRU (if at limit).
-    // Returns nullptr if connection creation fails.
-    // Thread-safe.
-    std::shared_ptr<TlsConnection> acquire(const TunnelKey& key, TlsContext& ctx);
+    // Acquire a connection. Blocks up to acquire_timeout_sec if pool is full.
+    // Performs health check on reused connections.
+    AcquireResult acquire(const TunnelKey& key, TlsContext& ctx);
 
-    // Release a connection back to the pool for future reuse.
-    // Updates the tunnel's last_used timestamp.
-    // Thread-safe.
+    // Release a connection back to IDLE state.
+    // Wakes up one thread waiting in acquire().
     void release(const TunnelKey& key, std::shared_ptr<TlsConnection> conn);
 
-    // Remove a specific connection from the pool (e.g., on error).
-    // Thread-safe.
+    // Mark a connection as BROKEN and remove it from the pool.
     void remove(const TunnelKey& key, std::shared_ptr<TlsConnection> conn);
 
-    // Remove all connections for a given tunnel key.
-    // Thread-safe.
+    // Remove all connections for a tunnel.
     void remove_tunnel(const TunnelKey& key);
 
-    // Clean up idle connections that have exceeded idle_timeout_sec.
-    // Iterates all tunnels and removes timed-out connections.
-    // Thread-safe.
+    // Clean up IDLE connections that exceeded idle_timeout_sec.
+    // Only removes IDLE connections; IN_USE connections are untouched.
     void cleanup_idle();
 
-    // Get a snapshot of pool statistics.
-    // Thread-safe.
+    // Get pool statistics.
     PoolStats stats() const;
 
-    // Thread-safe iteration over all connections.
-    // The callback receives each TunnelKey and its associated TlsConnection.
-    // The pool mutex is held during iteration; keep callbacks short.
+    // Thread-safe iteration.
     void for_each(std::function<void(const TunnelKey&, TlsConnection&)> fn);
 
 private:
-    // Internal state for each tunnel.
     struct TunnelEntry {
-        std::vector<std::shared_ptr<TlsConnection>> connections;
-        std::chrono::steady_clock::time_point last_used;
+        std::vector<PooledConn> connections;
     };
 
-    // Create a new TCP + TLS connection to the target specified by key.
-    // Performs DNS resolution, TCP connect, and TLS handshake.
-    // Returns nullptr on failure.
-    std::shared_ptr<TlsConnection> create_connection(const TunnelKey& key, TlsContext& ctx);
+    std::shared_ptr<TlsConnection> create_connection(
+        const TunnelKey& key, TlsContext& ctx);
+
+    // Count connections in a specific state for a tunnel entry.
+    size_t count_state(const TunnelEntry& entry, PooledConn::State state) const;
 
     PoolConfig config_;
     std::unordered_map<TunnelKey, TunnelEntry, TunnelKeyHash> tunnels_;
     mutable std::mutex mutex_;
+    std::condition_variable cv_;  // Signaled when a connection becomes IDLE
 };
 
 } // namespace gtls

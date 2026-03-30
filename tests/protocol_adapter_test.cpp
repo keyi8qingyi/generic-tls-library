@@ -82,6 +82,7 @@ RC_GTEST_FIXTURE_PROP(ProtocolAdapterPropertyTest, RoutingCallbackDrivenSend, ()
 
     PoolConfig pool_cfg;
     pool_cfg.max_connections_per_target = 4;
+    pool_cfg.acquire_timeout_sec = 0;
     ConnectionPool pool(pool_cfg);
 
     // Generate random adapter name.
@@ -130,6 +131,7 @@ RC_GTEST_FIXTURE_PROP(ProtocolAdapterPropertyTest, ExplicitConnectionFallback, (
     TlsContext ctx(cfg);
 
     PoolConfig pool_cfg;
+    pool_cfg.acquire_timeout_sec = 0;
     ConnectionPool pool(pool_cfg);
 
     auto adapter_name = *rc::gen::nonEmpty(
@@ -311,6 +313,7 @@ RC_GTEST_FIXTURE_PROP(ProtocolAdapterPropertyTest, MultiInstanceIndependence, ()
     TlsConfig cfg = make_test_config();
     TlsContext ctx(cfg);
     PoolConfig pool_cfg;
+    pool_cfg.acquire_timeout_sec = 0;
     ConnectionPool pool(pool_cfg);
 
     std::vector<unsigned char> data = {0x01, 0x02};

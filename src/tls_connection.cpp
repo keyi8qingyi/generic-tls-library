@@ -138,6 +138,49 @@ std::mutex& TlsConnection::mutex() {
     return mutex_;
 }
 
+bool TlsConnection::is_alive() const {
+    if (!ssl_ || state_ != ConnState::Connected) {
+        return false;
+    }
+
+    // Use poll() with zero timeout to check socket health without blocking.
+    int fd = SSL_get_fd(ssl_.get());
+    if (fd < 0) {
+        return false;
+    }
+
+    struct pollfd pfd = {};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+
+    int ret = ::poll(&pfd, 1, 0);
+
+    // Socket error conditions mean the connection is broken.
+    if (ret > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        Logger::log(LogLevel::Debug,
+                    "TlsConnection::is_alive: socket error detected (revents=0x%x)",
+                    pfd.revents);
+        return false;
+    }
+
+    // If data is available, try SSL_peek to verify TLS layer is healthy.
+    if (ret > 0 && (pfd.revents & POLLIN)) {
+        unsigned char peek_buf[1];
+        int peek_ret = SSL_peek(ssl_.get(), peek_buf, 1);
+        if (peek_ret <= 0) {
+            int err = SSL_get_error(ssl_.get(), peek_ret);
+            // WANT_READ is normal (no data yet), anything else is broken.
+            if (err != SSL_ERROR_WANT_READ) {
+                Logger::log(LogLevel::Debug,
+                            "TlsConnection::is_alive: SSL_peek failed, error=%d", err);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------

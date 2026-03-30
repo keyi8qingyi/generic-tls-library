@@ -89,6 +89,11 @@ public:
     // Get the mutex for thread-safe access to this connection.
     std::mutex& mutex();
 
+    // Check if the TLS connection is still alive and usable.
+    // Performs a non-destructive check using SSL_peek with zero timeout.
+    // Returns true if the connection appears healthy, false if broken.
+    bool is_alive() const;
+
 private:
     // Perform non-blocking SSL handshake with poll-based timeout.
     // handshake_fn is either SSL_connect or SSL_accept.

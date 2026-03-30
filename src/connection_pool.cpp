@@ -1,5 +1,5 @@
 // =============================================================================
-// Generic TLS Library (gtls) - Connection pool implementation
+// Generic TLS Library (gtls) - Connection pool implementation (v2)
 // =============================================================================
 
 #include "gtls/connection_pool.h"
@@ -19,6 +19,8 @@ namespace gtls {
 
 using std::chrono::steady_clock;
 using std::chrono::seconds;
+using std::chrono::milliseconds;
+using std::chrono::duration_cast;
 
 // ---------------------------------------------------------------------------
 // TunnelKey
@@ -31,7 +33,6 @@ bool TunnelKey::operator==(const TunnelKey& other) const {
 }
 
 std::size_t TunnelKeyHash::operator()(const TunnelKey& key) const {
-    // Combine hashes of host, port, and tls_config_name using FNV-like mixing.
     std::size_t h = std::hash<std::string>{}(key.host);
     h ^= std::hash<uint16_t>{}(key.port) + 0x9e3779b9 + (h << 6) + (h >> 2);
     h ^= std::hash<std::string>{}(key.tls_config_name) + 0x9e3779b9 + (h << 6) + (h >> 2);
@@ -39,7 +40,20 @@ std::size_t TunnelKeyHash::operator()(const TunnelKey& key) const {
 }
 
 // ---------------------------------------------------------------------------
-// ConnectionPool construction / destruction
+// Helper: log with tunnel key, state, and timestamp
+// ---------------------------------------------------------------------------
+static void log_pool_event(LogLevel level, const TunnelKey& key,
+                           const char* event) {
+    auto ts = duration_cast<milliseconds>(
+        steady_clock::now().time_since_epoch()).count();
+    Logger::log(level,
+                "ConnectionPool: %s [%s:%u/%s] ts=%lld",
+                event, key.host.c_str(), key.port,
+                key.tls_config_name.c_str(), (long long)ts);
+}
+
+// ---------------------------------------------------------------------------
+// Construction / Destruction
 // ---------------------------------------------------------------------------
 
 ConnectionPool::ConnectionPool(PoolConfig config)
@@ -48,87 +62,100 @@ ConnectionPool::ConnectionPool(PoolConfig config)
 ConnectionPool::~ConnectionPool() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [key, entry] : tunnels_) {
-        for (auto& conn : entry.connections) {
-            if (conn) {
-                auto now = steady_clock::now();
-                auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now.time_since_epoch()).count();
-                Logger::log(LogLevel::Info,
-                            "ConnectionPool: shutdown connection [%s:%u/%s] state=Disconnected ts=%lld",
-                            key.host.c_str(), key.port,
-                            key.tls_config_name.c_str(), (long long)ts);
-                conn->shutdown();
+        for (auto& pc : entry.connections) {
+            if (pc.conn) {
+                log_pool_event(LogLevel::Info, key, "shutdown state=Disconnected");
+                pc.conn->shutdown();
             }
         }
-        entry.connections.clear();
     }
     tunnels_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// count_state
+// ---------------------------------------------------------------------------
+
+size_t ConnectionPool::count_state(const TunnelEntry& entry,
+                                    PooledConn::State state) const {
+    size_t n = 0;
+    for (const auto& pc : entry.connections) {
+        if (pc.state == state) ++n;
+    }
+    return n;
 }
 
 // ---------------------------------------------------------------------------
 // acquire()
 // ---------------------------------------------------------------------------
 
-std::shared_ptr<TlsConnection> ConnectionPool::acquire(const TunnelKey& key,
-                                                         TlsContext& ctx) {
-    std::lock_guard<std::mutex> lock(mutex_);
+AcquireResult ConnectionPool::acquire(const TunnelKey& key, TlsContext& ctx) {
+    std::unique_lock<std::mutex> lock(mutex_);
 
-    auto& entry = tunnels_[key];
+    auto deadline = steady_clock::now() + seconds(config_.acquire_timeout_sec);
 
-    // Strategy 1: Find an existing idle connection (Connected state).
-    for (auto& conn : entry.connections) {
-        if (conn && conn->state() == ConnState::Connected) {
-            entry.last_used = steady_clock::now();
+    while (true) {
+        auto& entry = tunnels_[key];
 
-            auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                entry.last_used.time_since_epoch()).count();
-            Logger::log(LogLevel::Debug,
-                        "ConnectionPool: reuse connection [%s:%u/%s] state=Connected ts=%lld",
-                        key.host.c_str(), key.port,
-                        key.tls_config_name.c_str(), (long long)ts);
-            return conn;
+        // Strategy 1: Find an IDLE connection, with health check.
+        for (auto& pc : entry.connections) {
+            if (pc.state == PooledConn::State::IDLE && pc.conn) {
+                // Health check before handing out.
+                if (!pc.conn->is_alive()) {
+                    log_pool_event(LogLevel::Warning, key,
+                                   "health check failed, marking BROKEN");
+                    pc.state = PooledConn::State::BROKEN;
+                    pc.conn->shutdown();
+                    continue;
+                }
+                pc.state = PooledConn::State::IN_USE;
+                pc.last_used = steady_clock::now();
+                log_pool_event(LogLevel::Debug, key,
+                               "acquire reuse state=IDLE->IN_USE");
+                return {pc.conn, TlsError::Ok};
+            }
         }
-    }
 
-    // Strategy 2: Create a new connection if under the per-target limit.
-    int current_count = static_cast<int>(entry.connections.size());
-    if (current_count < config_.max_connections_per_target) {
-        // Release the pool lock during connection creation to avoid
-        // holding it during potentially slow network operations.
-        // We must unlock, create, then re-lock and insert.
-        // However, since we use lock_guard, we do the creation inline.
-        // For simplicity and correctness, we create under the lock.
-        // In production, consider upgrading to a more sophisticated scheme.
-        auto conn = create_connection(key, ctx);
-        if (conn) {
-            entry.connections.push_back(conn);
-            entry.last_used = steady_clock::now();
+        // Purge BROKEN connections before counting.
+        entry.connections.erase(
+            std::remove_if(entry.connections.begin(), entry.connections.end(),
+                           [](const PooledConn& pc) {
+                               return pc.state == PooledConn::State::BROKEN;
+                           }),
+            entry.connections.end());
 
-            auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                entry.last_used.time_since_epoch()).count();
-            Logger::log(LogLevel::Info,
-                        "ConnectionPool: new connection [%s:%u/%s] state=Connected ts=%lld",
-                        key.host.c_str(), key.port,
-                        key.tls_config_name.c_str(), (long long)ts);
+        // Strategy 2: Create new if under limit.
+        int total = static_cast<int>(entry.connections.size());
+        if (total < config_.max_connections_per_target) {
+            // Unlock during potentially slow network operation.
+            lock.unlock();
+            auto conn = create_connection(key, ctx);
+            lock.lock();
+
+            if (conn) {
+                auto& e = tunnels_[key];  // Re-fetch after re-lock
+                PooledConn pc(conn);
+                pc.state = PooledConn::State::IN_USE;
+                e.connections.push_back(std::move(pc));
+                log_pool_event(LogLevel::Info, key,
+                               "acquire new state=IN_USE");
+                return {conn, TlsError::Ok};
+            }
+            // Creation failed — fall through to wait or fail.
+            log_pool_event(LogLevel::Error, key,
+                           "acquire create_connection failed");
         }
-        return conn;
+
+        // Strategy 3: Wait for a connection to become IDLE.
+        auto now = steady_clock::now();
+        if (now >= deadline) {
+            log_pool_event(LogLevel::Warning, key,
+                           "acquire timeout, pool exhausted");
+            return {nullptr, TlsError::PoolExhausted};
+        }
+
+        cv_.wait_until(lock, deadline);
     }
-
-    // Strategy 3: At limit — reuse the least-recently-used (first) connection.
-    if (!entry.connections.empty()) {
-        auto& conn = entry.connections.front();
-        entry.last_used = steady_clock::now();
-
-        auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-            entry.last_used.time_since_epoch()).count();
-        Logger::log(LogLevel::Debug,
-                    "ConnectionPool: reuse LRU connection [%s:%u/%s] state=AtLimit ts=%lld",
-                    key.host.c_str(), key.port,
-                    key.tls_config_name.c_str(), (long long)ts);
-        return conn;
-    }
-
-    return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,31 +164,35 @@ std::shared_ptr<TlsConnection> ConnectionPool::acquire(const TunnelKey& key,
 
 void ConnectionPool::release(const TunnelKey& key,
                               std::shared_ptr<TlsConnection> conn) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
 
-    auto it = tunnels_.find(key);
-    if (it == tunnels_.end()) {
-        // Tunnel not found; create a new entry and add the connection.
-        TunnelEntry entry;
-        entry.connections.push_back(std::move(conn));
-        entry.last_used = steady_clock::now();
-        tunnels_[key] = std::move(entry);
-    } else {
-        // Check if connection is already in the pool.
-        auto& conns = it->second.connections;
-        auto found = std::find(conns.begin(), conns.end(), conn);
-        if (found == conns.end()) {
-            conns.push_back(std::move(conn));
+        auto it = tunnels_.find(key);
+        if (it != tunnels_.end()) {
+            for (auto& pc : it->second.connections) {
+                if (pc.conn == conn) {
+                    pc.state = PooledConn::State::IDLE;
+                    pc.last_used = steady_clock::now();
+                    log_pool_event(LogLevel::Debug, key,
+                                   "release state=IN_USE->IDLE");
+                    goto notify;
+                }
+            }
         }
-        it->second.last_used = steady_clock::now();
+
+        // Connection not found in pool — add it as new IDLE entry.
+        {
+            auto& entry = tunnels_[key];
+            PooledConn pc(std::move(conn));
+            pc.state = PooledConn::State::IDLE;
+            entry.connections.push_back(std::move(pc));
+            log_pool_event(LogLevel::Debug, key,
+                           "release new entry state=IDLE");
+        }
     }
 
-    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-        steady_clock::now().time_since_epoch()).count();
-    Logger::log(LogLevel::Debug,
-                "ConnectionPool: release connection [%s:%u/%s] state=Released ts=%lld",
-                key.host.c_str(), key.port,
-                key.tls_config_name.c_str(), (long long)ts);
+notify:
+    cv_.notify_one();
 }
 
 // ---------------------------------------------------------------------------
@@ -173,28 +204,18 @@ void ConnectionPool::remove(const TunnelKey& key,
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = tunnels_.find(key);
-    if (it == tunnels_.end()) {
-        return;
-    }
+    if (it == tunnels_.end()) return;
 
     auto& conns = it->second.connections;
-    auto found = std::find(conns.begin(), conns.end(), conn);
-    if (found != conns.end()) {
-        auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-            steady_clock::now().time_since_epoch()).count();
-        Logger::log(LogLevel::Info,
-                    "ConnectionPool: remove connection [%s:%u/%s] state=Removed ts=%lld",
-                    key.host.c_str(), key.port,
-                    key.tls_config_name.c_str(), (long long)ts);
-
-        // Shutdown the connection before removing.
-        if (*found) {
-            (*found)->shutdown();
+    for (auto ci = conns.begin(); ci != conns.end(); ++ci) {
+        if (ci->conn == conn) {
+            log_pool_event(LogLevel::Info, key, "remove state=BROKEN");
+            if (ci->conn) ci->conn->shutdown();
+            conns.erase(ci);
+            break;
         }
-        conns.erase(found);
     }
 
-    // Remove the tunnel entry if no connections remain.
     if (conns.empty()) {
         tunnels_.erase(it);
     }
@@ -208,30 +229,18 @@ void ConnectionPool::remove_tunnel(const TunnelKey& key) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = tunnels_.find(key);
-    if (it == tunnels_.end()) {
-        return;
+    if (it == tunnels_.end()) return;
+
+    log_pool_event(LogLevel::Info, key, "remove_tunnel");
+
+    for (auto& pc : it->second.connections) {
+        if (pc.conn) pc.conn->shutdown();
     }
-
-    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-        steady_clock::now().time_since_epoch()).count();
-    Logger::log(LogLevel::Info,
-                "ConnectionPool: remove tunnel [%s:%u/%s] connections=%zu state=TunnelRemoved ts=%lld",
-                key.host.c_str(), key.port,
-                key.tls_config_name.c_str(),
-                it->second.connections.size(), (long long)ts);
-
-    // Shutdown all connections in this tunnel.
-    for (auto& conn : it->second.connections) {
-        if (conn) {
-            conn->shutdown();
-        }
-    }
-
     tunnels_.erase(it);
 }
 
 // ---------------------------------------------------------------------------
-// cleanup_idle()
+// cleanup_idle() — per-connection granularity
 // ---------------------------------------------------------------------------
 
 void ConnectionPool::cleanup_idle() {
@@ -240,31 +249,28 @@ void ConnectionPool::cleanup_idle() {
     auto now = steady_clock::now();
     auto timeout = seconds(config_.idle_timeout_sec);
 
-    // Collect tunnel keys to erase after iteration.
     std::vector<TunnelKey> empty_tunnels;
 
     for (auto& [key, entry] : tunnels_) {
-        // Check if the entire tunnel has been idle beyond the timeout.
-        if ((now - entry.last_used) >= timeout) {
-            auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()).count();
-            Logger::log(LogLevel::Info,
-                        "ConnectionPool: cleanup idle tunnel [%s:%u/%s] connections=%zu state=IdleTimeout ts=%lld",
-                        key.host.c_str(), key.port,
-                        key.tls_config_name.c_str(),
-                        entry.connections.size(), (long long)ts);
-
-            for (auto& conn : entry.connections) {
-                if (conn) {
-                    conn->shutdown();
-                }
+        // Only remove IDLE connections that have exceeded the timeout.
+        auto& conns = entry.connections;
+        for (auto ci = conns.begin(); ci != conns.end(); ) {
+            if (ci->state == PooledConn::State::IDLE &&
+                (now - ci->last_used) >= timeout) {
+                log_pool_event(LogLevel::Info, key,
+                               "cleanup idle connection state=IdleTimeout");
+                if (ci->conn) ci->conn->shutdown();
+                ci = conns.erase(ci);
+            } else {
+                ++ci;
             }
-            entry.connections.clear();
+        }
+
+        if (conns.empty()) {
             empty_tunnels.push_back(key);
         }
     }
 
-    // Remove empty tunnel entries.
     for (const auto& key : empty_tunnels) {
         tunnels_.erase(key);
     }
@@ -277,14 +283,14 @@ void ConnectionPool::cleanup_idle() {
 PoolStats ConnectionPool::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    PoolStats s;
-    s.total_active = 0;
-    s.total_capacity = 0;
+    PoolStats s{};
 
     for (const auto& [key, entry] : tunnels_) {
         size_t count = entry.connections.size();
         s.per_target[key] = count;
         s.total_active += count;
+        s.total_idle += count_state(entry, PooledConn::State::IDLE);
+        s.total_in_use += count_state(entry, PooledConn::State::IN_USE);
         s.total_capacity += static_cast<size_t>(config_.max_connections_per_target);
     }
 
@@ -300,25 +306,22 @@ void ConnectionPool::for_each(
     std::lock_guard<std::mutex> lock(mutex_);
 
     for (auto& [key, entry] : tunnels_) {
-        for (auto& conn : entry.connections) {
-            if (conn) {
-                fn(key, *conn);
-            }
+        for (auto& pc : entry.connections) {
+            if (pc.conn) fn(key, *pc.conn);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// create_connection() — private helper
+// create_connection()
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<TlsConnection> ConnectionPool::create_connection(
     const TunnelKey& key, TlsContext& ctx) {
 
-    // Resolve the target host address.
     struct addrinfo hints = {};
-    hints.ai_family = AF_UNSPEC;      // Support both IPv4 and IPv6
-    hints.ai_socktype = SOCK_STREAM;  // TCP
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
     std::string port_str = std::to_string(key.port);
@@ -333,23 +336,14 @@ std::shared_ptr<TlsConnection> ConnectionPool::create_connection(
         return nullptr;
     }
 
-    // Try each resolved address until one succeeds.
     int sock = -1;
     for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
         sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sock < 0) {
-            continue;
-        }
-
-        if (::connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
-            break;  // Successfully connected.
-        }
-
-        // Connect failed for this address; close and try next.
+        if (sock < 0) continue;
+        if (::connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) break;
         ::close(sock);
         sock = -1;
     }
-
     ::freeaddrinfo(result);
 
     if (sock < 0) {
@@ -359,13 +353,11 @@ std::shared_ptr<TlsConnection> ConnectionPool::create_connection(
         return nullptr;
     }
 
-    // Create TLS connection and perform handshake.
     auto conn = std::make_shared<TlsConnection>(ctx, sock);
     if (!conn->connect(config_.connect_timeout_sec, key.host)) {
         Logger::log(LogLevel::Error,
                     "ConnectionPool: TLS handshake failed for %s:%u",
                     key.host.c_str(), key.port);
-        // TlsConnection::connect() handles cleanup on failure.
         return nullptr;
     }
 

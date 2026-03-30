@@ -4,6 +4,7 @@
 
 #include "gtls/protocol_adapter.h"
 #include "gtls/logger.h"
+#include "gtls/tls_error.h"
 #include "gtls/tls_io.h"
 
 #include <cstdlib>
@@ -154,16 +155,17 @@ int ProtocolAdapter::send(ConnectionPool& pool, TlsContext& ctx,
         TunnelKey key = routing_cb_(data, len);
 
         // Acquire a connection from the pool for this tunnel.
-        auto conn = pool.acquire(key, ctx);
-        if (!conn) {
+        auto result = pool.acquire(key, ctx);
+        if (!result.conn) {
             Logger::log(LogLevel::Error,
-                        "ProtocolAdapter[%s]: failed to acquire connection for [%s:%u/%s]",
+                        "ProtocolAdapter[%s]: failed to acquire connection for [%s:%u/%s] error=%s",
                         name_.c_str(), key.host.c_str(), key.port,
-                        key.tls_config_name.c_str());
+                        key.tls_config_name.c_str(),
+                        tls_error_to_string(result.error));
             return -1;
         }
 
-        SSL* ssl = conn->ssl();
+        SSL* ssl = result.conn->ssl();
         if (!ssl) {
             Logger::log(LogLevel::Error,
                         "ProtocolAdapter[%s]: acquired connection has null SSL for [%s:%u/%s]",
