@@ -134,6 +134,18 @@ AcquireResult ConnectionPool::acquire(const TunnelKey& key, TlsContext& ctx) {
 
             if (conn) {
                 auto& e = tunnels_[key];  // Re-fetch after re-lock
+                // Re-check limit after re-lock: another thread may have
+                // created a connection while we were unlocked.
+                int new_total = static_cast<int>(e.connections.size());
+                if (new_total >= config_.max_connections_per_target) {
+                    // Over limit due to concurrent creation. Shut down
+                    // the connection we just made and retry the loop
+                    // (will either find an IDLE or wait on cv).
+                    log_pool_event(LogLevel::Debug, key,
+                                   "acquire over limit after re-lock, discarding new conn");
+                    conn->shutdown();
+                    continue;
+                }
                 PooledConn pc(conn);
                 pc.state = PooledConn::State::IN_USE;
                 e.connections.push_back(std::move(pc));
@@ -166,6 +178,30 @@ void ConnectionPool::release(const TunnelKey& key,
                               std::shared_ptr<TlsConnection> conn) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
+
+        // Health check on release: don't return broken connections to the pool.
+        // Only check connections that were in Connected state (completed handshake).
+        // Disconnected connections (e.g., manually added via release) skip the check.
+        if (conn && conn->state() == ConnState::Connected && !conn->is_alive()) {
+            log_pool_event(LogLevel::Warning, key,
+                           "release health check failed, marking BROKEN");
+            // Find and remove from pool if present.
+            auto it = tunnels_.find(key);
+            if (it != tunnels_.end()) {
+                auto& conns = it->second.connections;
+                for (auto ci = conns.begin(); ci != conns.end(); ++ci) {
+                    if (ci->conn == conn) {
+                        ci->state = PooledConn::State::BROKEN;
+                        conn->shutdown();
+                        conns.erase(ci);
+                        break;
+                    }
+                }
+                if (conns.empty()) tunnels_.erase(it);
+            }
+            // Don't notify — no IDLE connection was added.
+            return;
+        }
 
         auto it = tunnels_.find(key);
         if (it != tunnels_.end()) {
